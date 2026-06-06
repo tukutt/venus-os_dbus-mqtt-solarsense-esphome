@@ -4,6 +4,8 @@ driver_path="/data/etc"
 driver_name="dbus-mqtt-solarsense"
 # GitHub repository name (differs from the driver/folder name)
 repo_name="venus-os_dbus-mqtt-solarsense-esphome"
+# Default branch, used as a fallback when no GitHub release is published yet
+branch="master"
 
 echo ""
 echo ""
@@ -17,16 +19,24 @@ latest_release_stable=$(curl -s https://api.github.com/repos/tukutt/${repo_name}
 echo
 PS3=$'\nSelect which version you want to install and enter the corresponding number: '
 
+# If no GitHub release is published yet, fall back to the latest commit of the
+# default branch so the driver can still be installed.
+if [ -z "$latest_release_stable" ]; then
+    stable_label="latest '$branch' branch (no release published yet)"
+else
+    stable_label="latest release \"$latest_release_stable\""
+fi
+
 # create list of versions
 version_list=(
-    "latest release \"$latest_release_stable\""
+    "$stable_label"
     "quit"
 )
 
 select version in "${version_list[@]}"
 do
     case $version in
-        "latest release \"$latest_release_stable\"")
+        "$stable_label")
             break
             ;;
         "quit")
@@ -79,6 +89,12 @@ echo "Downloading driver..."
 
 # download latest release
 url=$(curl -s https://api.github.com/repos/tukutt/${repo_name}/releases/latest | grep "zipball_url" | sed -n 's/.*"zipball_url": "\([^"]*\)".*/\1/p')
+
+# No published release: fall back to the default branch archive.
+if [ -z "$url" ]; then
+    echo "No published release found, downloading the latest '${branch}' branch instead."
+    url="https://github.com/tukutt/${repo_name}/archive/refs/heads/${branch}.zip"
+fi
 
 echo "Downloading from: $url"
 wget -O /tmp/venus-os_${driver_name}.zip "$url"
