@@ -1,6 +1,6 @@
 # dbus-mqtt-solarsense - Bridge a Victron SolarSense 750 (via an ESP32/ESPHome) to the native Venus OS meteo service
 
-<small>GitHub repository: [tukutt/venus-os_dbus-mqtt-solarsense](https://github.com/tukutt/venus-os_dbus-mqtt-solarsense)</small>
+<small>GitHub repository: [tukutt/venus-os_dbus-mqtt-solarsense-esphome](https://github.com/tukutt/venus-os_dbus-mqtt-solarsense-esphome)</small>
 
 ## Index
 
@@ -199,7 +199,7 @@ in the GUI).
 2. Execute these commands to download and copy the files:
 
     ```bash
-    wget -O /tmp/download_dbus-mqtt-solarsense.sh https://raw.githubusercontent.com/tukutt/venus-os_dbus-mqtt-solarsense/master/download.sh
+    wget -O /tmp/download_dbus-mqtt-solarsense.sh https://raw.githubusercontent.com/tukutt/venus-os_dbus-mqtt-solarsense-esphome/master/download.sh
 
     bash /tmp/download_dbus-mqtt-solarsense.sh
     ```

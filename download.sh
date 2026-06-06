@@ -2,6 +2,8 @@
 
 driver_path="/data/etc"
 driver_name="dbus-mqtt-solarsense"
+# GitHub repository name (differs from the driver/folder name)
+repo_name="venus-os_dbus-mqtt-solarsense-esphome"
 
 echo ""
 echo ""
@@ -10,7 +12,7 @@ echo ""
 echo -n "Fetch current version numbers..."
 
 # latest release
-latest_release_stable=$(curl -s https://api.github.com/repos/tukutt/venus-os_${driver_name}/releases/latest | grep "tag_name" | cut -d : -f 2,3 | tr -d "\ " | tr -d \" | tr -d \,)
+latest_release_stable=$(curl -s https://api.github.com/repos/tukutt/${repo_name}/releases/latest | grep "tag_name" | cut -d : -f 2,3 | tr -d "\ " | tr -d \" | tr -d \,)
 
 echo
 PS3=$'\nSelect which version you want to install and enter the corresponding number: '
@@ -76,7 +78,7 @@ echo "Downloading driver..."
 
 
 # download latest release
-url=$(curl -s https://api.github.com/repos/tukutt/venus-os_${driver_name}/releases/latest | grep "zipball_url" | sed -n 's/.*"zipball_url": "\([^"]*\)".*/\1/p')
+url=$(curl -s https://api.github.com/repos/tukutt/${repo_name}/releases/latest | grep "zipball_url" | sed -n 's/.*"zipball_url": "\([^"]*\)".*/\1/p')
 
 echo "Downloading from: $url"
 wget -O /tmp/venus-os_${driver_name}.zip "$url"
