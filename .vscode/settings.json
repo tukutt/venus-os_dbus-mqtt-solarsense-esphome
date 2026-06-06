@@ -1,0 +1,6 @@
+{
+    "python.analysis.extraPaths": [
+        "./dbus-mqtt-solarsense/ext/velib_python"
+    ],
+    "[python]": { "editor.formatOnSave": true }
+}

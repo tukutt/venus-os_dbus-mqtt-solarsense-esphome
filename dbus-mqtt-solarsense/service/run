@@ -1,0 +1,4 @@
+#!/bin/sh
+echo "*** starting dbus-mqtt-solarsense ***"
+exec 2>&1
+exec python /data/etc/dbus-mqtt-solarsense/dbus-mqtt-solarsense.py
