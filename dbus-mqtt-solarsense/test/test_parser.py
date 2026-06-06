@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 
 """
-Unit tests for the Home Assistant MQTT Statestream -> Victron dbus
+Unit tests for the ESPHome native MQTT -> Victron dbus
 (com.victronenergy.meteo) translation logic for the SolarSense 750.
 
-These tests simulate Statestream MQTT messages (topic/payload pairs), including
-the awkward real-world cases:
-  * "unavailable" / "unknown" / "nan" / "" payloads (ESP offline / no value)
+These tests simulate ESPHome state-topic messages (topic/payload pairs),
+including the awkward real-world cases:
+  * topics on different platform levels: sensor/ AND text_sensor/
+  * "unavailable" / "unknown" / "nan" / "" payloads
   * ErrorCode as a hex string "0x04001405"
   * Today's Yield slug ("today_s_yield") -> "0.07"
   * time_since_last_sun "330"
-  * an entity_id that duplicates the prefix (solarsense_solarsense_irradiance)
+  * an object_id that duplicates the prefix (solarsense_solarsense_irradiance)
   * a *charger_error entity that must be IGNORED (not bridged to dbus)
+  * '-'-slugified ids (some ESPHome versions) treated like '_'
+  * wildcard mode (empty base_topic) vs. an explicit base_topic
+  * the <base>/status availability LWT
 
 Run with:  python3 test/test_parser.py
 (no external dependencies, no dbus/GLib/paho needed)
@@ -28,14 +32,21 @@ from solarsense_parser import (  # noqa: E402
     parse_float,
     parse_int,
     parse_error_code,
-    entity_id_from_topic,
+    parse_status,
+    object_id_from_topic,
     match_path,
     parse_message,
 )
 
+NODE = "esphome-ble-proxy"
 
-def topic(entity_id, base="statestream"):
-    return "%s/sensor/%s/state" % (base, entity_id)
+
+def sensor_topic(object_id, base=NODE):
+    return "%s/sensor/%s/state" % (base, object_id)
+
+
+def text_topic(object_id, base=NODE):
+    return "%s/text_sensor/%s/state" % (base, object_id)
 
 
 class TestValueParsing(unittest.TestCase):
@@ -64,20 +75,32 @@ class TestValueParsing(unittest.TestCase):
         for bad in ("unavailable", "unknown", "", "nan", None, "zzz"):
             self.assertIsNone(parse_error_code(bad), "expected None for %r" % bad)
 
+    def test_parse_status(self):
+        self.assertTrue(parse_status("online"))
+        self.assertFalse(parse_status("offline"))
+        self.assertIsNone(parse_status("whatever"))
+        self.assertIsNone(parse_status(None))
+
 
 class TestTopicParsing(unittest.TestCase):
-    def test_entity_id_extracted(self):
-        self.assertEqual(entity_id_from_topic("statestream/sensor/solarsense_irradiance/state", "statestream"), "solarsense_irradiance")
+    def test_object_id_from_sensor_topic(self):
+        self.assertEqual(object_id_from_topic(sensor_topic("solarsense_irradiance"), NODE), "solarsense_irradiance")
+
+    def test_object_id_from_text_sensor_topic(self):
+        # error_code is a text_sensor -> different platform level, still parsed
+        self.assertEqual(object_id_from_topic(text_topic("solarsense_error_code"), NODE), "solarsense_error_code")
 
     def test_wrong_base_topic_ignored(self):
-        self.assertIsNone(entity_id_from_topic("homeassistant/sensor/solarsense_irradiance/state", "statestream"))
+        self.assertIsNone(object_id_from_topic(sensor_topic("solarsense_irradiance", base="other-node"), NODE))
+
+    def test_wildcard_base_accepts_any_node(self):
+        self.assertEqual(object_id_from_topic(sensor_topic("solarsense_irradiance", base="anything"), ""), "solarsense_irradiance")
 
     def test_non_state_topic_ignored(self):
-        self.assertIsNone(entity_id_from_topic("statestream/sensor/solarsense_irradiance/attributes", "statestream"))
+        self.assertIsNone(object_id_from_topic("%s/sensor/solarsense_irradiance/config" % NODE, NODE))
 
-    def test_binary_sensor_topic_ignored(self):
-        # we only subscribe to .../sensor/...; binary_sensor is not bridged
-        self.assertIsNone(entity_id_from_topic("statestream/binary_sensor/low_battery/state", "statestream"))
+    def test_status_topic_is_not_a_state_topic(self):
+        self.assertIsNone(object_id_from_topic("%s/status" % NODE, NODE))
 
 
 class TestMatchPath(unittest.TestCase):
@@ -92,13 +115,15 @@ class TestMatchPath(unittest.TestCase):
             "solarsense_time_since_last_sun": "/TimeSinceLastSun",
             "solarsense_error_code": "/ErrorCode",
         }
-        for eid, path in cases.items():
-            matched = match_path(eid)
-            self.assertIsNotNone(matched, "no match for %s" % eid)
+        for oid, path in cases.items():
+            matched = match_path(oid)
+            self.assertIsNotNone(matched, "no match for %s" % oid)
             self.assertEqual(matched[0], path)
 
+    def test_hyphen_slug_matches_like_underscore(self):
+        self.assertEqual(match_path("solarsense-installation-power")[0], "/InstallationPower")
+
     def test_prefix_duplicate_still_matches_on_suffix(self):
-        # ESPHome device name duplicating the prefix must not break matching
         matched = match_path("solarsense_solarsense_irradiance")
         self.assertIsNotNone(matched)
         self.assertEqual(matched[0], "/Irradiance")
@@ -113,59 +138,61 @@ class TestMatchPath(unittest.TestCase):
 
 class TestParseMessage(unittest.TestCase):
     def test_irradiance(self):
-        self.assertEqual(parse_message(topic("solarsense_irradiance"), "337.3"), ("/Irradiance", 337.3))
+        self.assertEqual(parse_message(sensor_topic("solarsense_irradiance"), "337.3", NODE), ("/Irradiance", 337.3))
 
     def test_installation_power_is_int(self):
-        path, value = parse_message(topic("solarsense_installation_power"), "412.0")
+        path, value = parse_message(sensor_topic("solarsense_installation_power"), "412.0", NODE)
         self.assertEqual(path, "/InstallationPower")
         self.assertEqual(value, 412)
         self.assertIsInstance(value, int)
 
     def test_todays_yield(self):
-        self.assertEqual(parse_message(topic("solarsense_today_s_yield"), "0.07"), ("/TodaysYield", 0.07))
+        self.assertEqual(parse_message(sensor_topic("solarsense_today_s_yield"), "0.07", NODE), ("/TodaysYield", 0.07))
 
     def test_time_since_last_sun(self):
-        self.assertEqual(parse_message(topic("solarsense_time_since_last_sun"), "330"), ("/TimeSinceLastSun", 330))
+        self.assertEqual(parse_message(sensor_topic("solarsense_time_since_last_sun"), "330", NODE), ("/TimeSinceLastSun", 330))
 
-    def test_error_code_hex(self):
-        path, value = parse_message(topic("solarsense_error_code"), "0x04001405")
+    def test_error_code_hex_on_text_sensor_level(self):
+        # error_code arrives under text_sensor/, not sensor/
+        path, value = parse_message(text_topic("solarsense_error_code"), "0x04001405", NODE)
         self.assertEqual(path, "/ErrorCode")
         self.assertEqual(value, 0x04001405)
         self.assertIsInstance(value, int)
 
     def test_prefix_duplicate_entity(self):
-        self.assertEqual(parse_message(topic("solarsense_solarsense_irradiance"), "500.5"), ("/Irradiance", 500.5))
+        self.assertEqual(parse_message(sensor_topic("solarsense_solarsense_irradiance"), "500.5", NODE), ("/Irradiance", 500.5))
 
     def test_charger_error_ignored(self):
-        self.assertIsNone(parse_message(topic("solarsense_charger_error"), "0x00000000"))
+        self.assertIsNone(parse_message(text_topic("solarsense_charger_error"), "0x00000000", NODE))
 
     def test_unavailable_ignored(self):
-        self.assertIsNone(parse_message(topic("solarsense_irradiance"), "unavailable"))
-        self.assertIsNone(parse_message(topic("solarsense_cell_temperature"), "nan"))
-        self.assertIsNone(parse_message(topic("solarsense_battery_voltage"), ""))
+        self.assertIsNone(parse_message(sensor_topic("solarsense_irradiance"), "unavailable", NODE))
+        self.assertIsNone(parse_message(sensor_topic("solarsense_cell_temperature"), "nan", NODE))
+        self.assertIsNone(parse_message(sensor_topic("solarsense_battery_voltage"), "", NODE))
 
-    def test_wrong_prefix_ignored(self):
-        # entity outside the configured prefix is dropped (Python-side filter)
-        self.assertIsNone(parse_message(topic("washingmachine_power"), "123"))
+    def test_other_prefix_ignored(self):
+        # the ESP's own system sensors (e.g. wifi/uptime) are dropped
+        self.assertIsNone(parse_message(sensor_topic("uptime"), "123", NODE))
+        self.assertIsNone(parse_message(sensor_topic("wifi_signal_db"), "-52", NODE))
 
-    def test_custom_base_topic_and_prefix(self):
-        msg = parse_message("ha/sensor/ss_irradiance/state", "200.0", base_topic="ha", entity_prefix="ss")
-        self.assertEqual(msg, ("/Irradiance", 200.0))
+    def test_wildcard_mode_no_base(self):
+        # empty base_topic: match any node, filter on object_id prefix only
+        self.assertEqual(parse_message(sensor_topic("solarsense_irradiance", base="whatever"), "200.0", ""), ("/Irradiance", 200.0))
 
 
 class TestNativeTypes(unittest.TestCase):
     def test_no_strings_on_measurement_paths(self):
         samples = [
-            (topic("solarsense_irradiance"), "337.3"),
-            (topic("solarsense_installation_power"), "412"),
-            (topic("solarsense_today_s_yield"), "0.07"),
-            (topic("solarsense_cell_temperature"), "21.4"),
-            (topic("solarsense_battery_voltage"), "3.28"),
-            (topic("solarsense_time_since_last_sun"), "330"),
-            (topic("solarsense_error_code"), "0x04001405"),
+            (sensor_topic("solarsense_irradiance"), "337.3"),
+            (sensor_topic("solarsense_installation_power"), "412"),
+            (sensor_topic("solarsense_today_s_yield"), "0.07"),
+            (sensor_topic("solarsense_cell_temperature"), "21.4"),
+            (sensor_topic("solarsense_battery_voltage"), "3.28"),
+            (sensor_topic("solarsense_time_since_last_sun"), "330"),
+            (text_topic("solarsense_error_code"), "0x04001405"),
         ]
         for t, p in samples:
-            result = parse_message(t, p)
+            result = parse_message(t, p, NODE)
             self.assertIsNotNone(result, "no result for %s = %s" % (t, p))
             _, value = result
             self.assertNotIsInstance(value, str, "%s should not be a string" % t)
@@ -173,22 +200,23 @@ class TestNativeTypes(unittest.TestCase):
 
 class TestRealisticStream(unittest.TestCase):
     def test_full_message_stream(self):
-        """Replay a full retained Statestream burst as received right after subscribe."""
+        """Replay a full retained ESPHome burst as received right after subscribe."""
         stream = [
-            (topic("solarsense_irradiance"), "337.3"),
-            (topic("solarsense_installation_power"), "412"),
-            (topic("solarsense_today_s_yield"), "0.07"),
-            (topic("solarsense_cell_temperature"), "21.4"),
-            (topic("solarsense_battery_voltage"), "3.28"),
-            (topic("solarsense_time_since_last_sun"), "0"),
-            (topic("solarsense_error_code"), "0x04001405"),
-            (topic("solarsense_charger_error"), "0x00000000"),   # must be ignored
-            ("statestream/binary_sensor/low_battery/state", "off"),  # not subscribed/bridged
-            (topic("solarsense_irradiance"), "unavailable"),     # glitch, must be ignored
+            (sensor_topic("solarsense_irradiance"), "337.3"),
+            (sensor_topic("solarsense_installation_power"), "412"),
+            (sensor_topic("solarsense_today_s_yield"), "0.07"),
+            (sensor_topic("solarsense_cell_temperature"), "21.4"),
+            (sensor_topic("solarsense_battery_voltage"), "3.28"),
+            (sensor_topic("solarsense_time_since_last_sun"), "0"),
+            (text_topic("solarsense_error_code"), "0x04001405"),
+            (text_topic("solarsense_charger_error"), "0x00000000"),    # must be ignored
+            ("%s/binary_sensor/low_battery/state" % NODE, "OFF"),       # not in prefix/map
+            (sensor_topic("uptime"), "98712"),                          # ESP system sensor
+            (sensor_topic("solarsense_irradiance"), "unavailable"),     # glitch, must be ignored
         ]
         produced = {}
         for t, p in stream:
-            result = parse_message(t, p)
+            result = parse_message(t, p, NODE)
             if result is not None:
                 path, value = result
                 produced[path] = value
@@ -200,8 +228,7 @@ class TestRealisticStream(unittest.TestCase):
         self.assertEqual(produced["/BatteryVoltage"], 3.28)
         self.assertEqual(produced["/TimeSinceLastSun"], 0)
         self.assertEqual(produced["/ErrorCode"], 0x04001405)
-        # charger_error and low_battery never produced a dbus path
-        self.assertNotIn("/ChargerError", produced)
+        # charger_error, low_battery and uptime never produced a dbus path
         self.assertEqual(len(produced), 7)
 
 

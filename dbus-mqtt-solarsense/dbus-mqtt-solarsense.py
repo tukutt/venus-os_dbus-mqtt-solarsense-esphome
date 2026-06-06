@@ -18,8 +18,8 @@ sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext", "velib_python"
 from vedbus import VeDbusService  # noqa: E402
 from ve_utils import get_vrm_portal_id  # noqa: E402
 
-# import the (dependency-free) SolarSense / Statestream translation logic
-from solarsense_parser import parse_message  # noqa: E402
+# import the (dependency-free) SolarSense ESPHome-MQTT translation logic
+from solarsense_parser import parse_message, parse_status  # noqa: E402
 
 
 # get values from config.ini file
@@ -78,11 +78,16 @@ def config_get(section, key, default):
 # a genuine outage (ESP down / out of BLE range), not at sunset.
 timeout = int(config_get("DEFAULT", "timeout", "300"))
 
-# Home Assistant MQTT Statestream topic structure:
-#   <base_topic>/sensor/<entity_id>/state
-base_topic = config_get("MQTT", "base_topic", "statestream")
+# ESPHome native MQTT topic structure:
+#   <base_topic>/<platform>/<object_id>/state   (platform = sensor / text_sensor / ...)
+#   <base_topic>/status                         (online / offline availability LWT)
+# base_topic is the ESPHome node name (its mqtt: topic_prefix). It is OPTIONAL:
+# leave it empty to subscribe in wildcard mode and rely on entity_prefix alone
+# (so nothing has to be re-synced if the ESP node is renamed). When set, it also
+# enables the <base_topic>/status LWT to drive /Connected.
+base_topic = config_get("MQTT", "base_topic", "").strip()
 
-# Only entities whose entity_id starts with this prefix are bridged. The MQTT
+# Only entities whose object_id starts with this prefix are bridged. The MQTT
 # '+' wildcard cannot filter a partial level, so the prefix is filtered in
 # Python (see solarsense_parser.parse_message).
 entity_prefix = config_get("MQTT", "entity_prefix", "solarsense")
@@ -90,8 +95,9 @@ entity_prefix = config_get("MQTT", "entity_prefix", "solarsense")
 
 # ----- shared runtime state -----
 mqtt_connected = 0
-last_changed = 0
-last_updated = 0
+last_changed = 0   # last change that still needs to be pushed to dbus
+last_updated = 0   # last change actually pushed to dbus
+last_data = 0      # last valid SENSOR message (drives the watchdog, NOT /status)
 
 
 # formatting helpers (gettextcallback: p = path, v = value)
@@ -131,10 +137,9 @@ def _hex(p, v):
 
 
 # dbus paths with their initial (idle) values and text formatters. The service
-# registers immediately with these defaults (all 0) and is populated as
-# Statestream messages arrive - no "minimum message" is required to start. HA
-# Statestream publishes retained, so the full state is received right after the
-# subscription.
+# registers immediately with these defaults (all 0) and is populated as ESPHome
+# messages arrive - no "minimum message" is required to start. ESPHome publishes
+# retained, so the full state is received right after the subscription.
 #
 # Float-typed paths are seeded with 0.0 so the dbus value keeps a float type.
 meteo_dict = {
@@ -186,21 +191,44 @@ def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
         logging.info("MQTT client: Connected to MQTT broker!")
         mqtt_connected = 1
-        # Subscribe to every Statestream sensor; the entity_prefix is filtered in
-        # Python because MQTT wildcards cannot match a partial topic level.
-        subscribe_topic = "%s/sensor/+/state" % base_topic
-        logging.info('MQTT client: Subscribing to "%s"' % subscribe_topic)
-        client.subscribe(subscribe_topic)
+        # Subscribe to every ESPHome state topic (any platform level: sensor,
+        # text_sensor, binary_sensor) plus the availability LWT. entity_prefix is
+        # filtered in Python because MQTT wildcards cannot match a partial level.
+        # With an empty base_topic we subscribe broker-wide and filter on the
+        # object_id prefix only (the /status LWT is then unavailable: node unknown).
+        if base_topic:
+            data_topic = "%s/+/+/state" % base_topic
+            status_topic = "%s/status" % base_topic
+        else:
+            data_topic = "+/+/+/state"
+            status_topic = None
+        logging.info('MQTT client: Subscribing to "%s"' % data_topic)
+        client.subscribe(data_topic)
+        if status_topic:
+            logging.info('MQTT client: Subscribing to "%s"' % status_topic)
+            client.subscribe(status_topic)
     else:
         logging.error("MQTT client: Failed to connect, return code %d\n", reason_code)
 
 
 def on_message(client, userdata, msg):
     try:
-        global meteo_dict, last_changed
+        global meteo_dict, last_changed, last_data
 
         payload = msg.payload.decode("utf-8") if isinstance(msg.payload, (bytes, bytearray)) else str(msg.payload)
         payload = payload.strip()
+
+        # Availability LWT: <base_topic>/status = online/offline (only when
+        # base_topic is configured). Drives /Connected directly; it does NOT
+        # count as fresh data for the watchdog (the ESP can be online while the
+        # SolarSense is out of BLE range).
+        if base_topic and msg.topic == ("%s/status" % base_topic):
+            online = parse_status(payload)
+            if online is not None:
+                meteo_dict["/Connected"]["value"] = 1 if online else 0
+                logging.info("ESPHome availability: %s" % ("online" if online else "offline"))
+                last_changed = int(time())
+            return
 
         result = parse_message(msg.topic, payload, base_topic, entity_prefix)
         if result is None:
@@ -214,7 +242,9 @@ def on_message(client, userdata, msg):
         meteo_dict["/Connected"]["value"] = 1
 
         logging.debug('SolarSense %s = %s' % (path, value))
-        last_changed = int(time())
+        now = int(time())
+        last_changed = now
+        last_data = now
 
     except Exception:
         exception_type, exception_object, exception_traceback = sys.exc_info()
@@ -274,21 +304,24 @@ class DbusMqttSolarSenseService:
 
     def _update(self):
 
-        global meteo_dict, last_changed, last_updated
+        global meteo_dict, last_changed, last_updated, last_data
 
         now = int(time())
 
-        # Watchdog: if no Statestream message arrived for `timeout` seconds the
-        # ESP32 is down or out of BLE range -> mark the sensor as not connected.
+        # Watchdog: if no SolarSense data arrived for `timeout` seconds the ESP32
+        # is down or the sensor is out of BLE range -> mark it as not connected.
         # IMPORTANT: do NOT zero /Irradiance (or any measurement): an absence of
         # data is not a measured value of zero. The last known values are kept on
         # the bus and only /Connected is set to 0. (The SolarSense also reports at
         # night with irradiance 0, so this never fires merely at sunset.)
-        if timeout != 0 and last_changed != 0 and (now - last_changed) > timeout:
+        # Note: only real sensor messages refresh last_data; the /status LWT does
+        # not, so a sensor out of BLE range is still caught even while the ESP
+        # reports itself "online".
+        if timeout != 0 and last_data != 0 and (now - last_data) > timeout:
             if meteo_dict["/Connected"]["value"] != 0:
-                logging.warning("Watchdog: no SolarSense message for %i seconds, setting Connected=0 (sensor offline / out of BLE range). Measurements are kept." % (now - last_changed))
-            meteo_dict["/Connected"]["value"] = 0
-            last_changed = 0  # mark watchdog handled, avoid re-logging every second
+                logging.warning("Watchdog: no SolarSense data for %i seconds, setting Connected=0 (sensor offline / out of BLE range). Measurements are kept." % (now - last_data))
+                meteo_dict["/Connected"]["value"] = 0
+                last_changed = now  # push the Connected=0 change once
 
         if last_changed != last_updated:
 
@@ -336,7 +369,7 @@ def main():
 
     # Register the dbus service FIRST, with idle defaults, before touching MQTT.
     # This way the sensor always appears in Venus OS / VRM even if the broker is
-    # unreachable. It is then populated as Statestream messages arrive.
+    # unreachable. It is then populated as ESPHome messages arrive.
     paths_dbus = {
         "/UpdateIndex": {"value": 0, "textformat": _n},
     }
